@@ -256,7 +256,7 @@ def loan_label(loan):
 
 def build_blinko_content():
     loans = get_outstanding_loans()
-    lines = ["# Money Lent", ""]
+    lines = ["#Finance", "# Money Lent", ""]
     if not loans:
         lines.append("No outstanding loans.")
         return "\n".join(lines)
