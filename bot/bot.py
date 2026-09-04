@@ -1566,7 +1566,7 @@ def main():
     application.add_handler(CallbackQueryHandler(edit_repayment, pattern=r"^edit_repay:"))
     application.add_handler(CallbackQueryHandler(edit_repay_amount, pattern=r"^edit_repay_amount:"))
     application.add_handler(CallbackQueryHandler(edit_repay_date, pattern=r"^edit_repay_date:"))
-    application.add_handler(CallbackQueryHandler(delete_repay, pattern=r"^delete_repay:"))
+    application.add_handler(CallbackQueryHandler(delete_repayment, pattern=r"^delete_repay:"))
     application.add_handler(CallbackQueryHandler(confirm_delete_repayment, pattern=r"^delete_repay_confirm:"))
     application.add_handler(CallbackQueryHandler(edit_calendar_today, pattern=r"^edit_(loan|repayment)_calendar_today$"))
     application.add_handler(CallbackQueryHandler(edit_calendar_day, pattern=r"^edit_(loan|repayment)_calendar_day:"))
