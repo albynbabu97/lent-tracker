@@ -426,22 +426,31 @@ async def calendar_today(update, context):
 async def calendar_day(update, context):
     query = update.callback_query
     await query.answer()
+
     parts = query.data.split(":")
-    prefix = parts[0]
-    selected_date = date(int(parts[1]), int(parts[2]), int(parts[3]))
+    prefix = parts[0].removesuffix("_day")
+
+    selected_date = date(
+        int(parts[1]),
+        int(parts[2]),
+        int(parts[3]),
+    )
 
     if prefix == "loan_calendar":
         pending = context.user_data.get("pending_loan")
         if not pending:
             await query.edit_message_text("This transaction has expired.")
             return
+
         pending["lent_at"] = date_to_iso(selected_date)
         await show_loan_confirmation(query, context)
+
     elif prefix == "repayment_calendar":
         pending = context.user_data.get("pending_repayment")
         if not pending:
             await query.edit_message_text("This repayment has expired.")
             return
+
         pending["paid_at"] = date_to_iso(selected_date)
         await show_repayment_confirmation(query, context)
 
