@@ -60,22 +60,67 @@ def init_db():
         )
     """)
 
-    # The previous version used loans.returned/returned_at. Since the current
-    # database contains only fake data, reset that old schema cleanly.
-    loan_columns = {
-        row["name"]
-        for row in conn.execute("PRAGMA table_info(loans)").fetchall()
-    }
+    loan_columns = {row["name"] for row in conn.execute("PRAGMA table_info(loans)").fetchall()}
+
+    # Migrate the obsolete returned/returned_at schema by clearing it only when
+    # it is the old fake schema. For the current schema, rebuild loans if needed
+    # so the amount column can safely contain negative values.
     if loan_columns and "returned" in loan_columns:
         logger.warning("Old loan schema detected; resetting fake transaction data.")
         conn.execute("DROP TABLE IF EXISTS repayments")
         conn.execute("DROP TABLE IF EXISTS loans")
+        loan_columns = set()
+
+    if loan_columns:
+        table_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='loans'"
+        ).fetchone()[0] or ""
+        if "CHECK (amount > 0)" in table_sql:
+            logger.info("Migrating loans table to support negative amounts.")
+            conn.execute("PRAGMA foreign_keys = OFF")
+            conn.execute("ALTER TABLE repayments RENAME TO repayments_old")
+            conn.execute("ALTER TABLE loans RENAME TO loans_old")
+            conn.execute("""
+                CREATE TABLE loans (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    person TEXT NOT NULL,
+                    amount INTEGER NOT NULL,
+                    purpose TEXT NOT NULL,
+                    lent_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE repayments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    loan_id INTEGER NOT NULL,
+                    amount INTEGER NOT NULL CHECK (amount > 0),
+                    paid_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (loan_id) REFERENCES loans(id) ON DELETE CASCADE
+                )
+            """)
+            conn.execute("""
+                INSERT INTO loans(id, person, amount, purpose, lent_at, created_at, updated_at)
+                SELECT id, person, amount, purpose, lent_at, created_at, updated_at
+                FROM loans_old
+            """)
+            conn.execute("""
+                INSERT INTO repayments(id, loan_id, amount, paid_at, created_at)
+                SELECT id, loan_id, amount, paid_at, created_at
+                FROM repayments_old
+            """)
+            conn.execute("DROP TABLE repayments_old")
+            conn.execute("DROP TABLE loans_old")
+            conn.execute("PRAGMA foreign_keys = ON")
+            loan_columns = {"id", "person", "amount", "purpose", "lent_at", "created_at", "updated_at"}
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS loans (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             person TEXT NOT NULL,
-            amount INTEGER NOT NULL CHECK (amount > 0),
+            amount INTEGER NOT NULL,
             purpose TEXT NOT NULL,
             lent_at TEXT NOT NULL,
             created_at TEXT NOT NULL,
@@ -93,6 +138,7 @@ def init_db():
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_loans_person ON loans(person)")
+
     conn.execute("CREATE INDEX IF NOT EXISTS idx_loans_lent_at ON loans(lent_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_repayments_loan_id ON repayments(loan_id)")
     conn.commit()
@@ -126,7 +172,10 @@ def get_loan(loan_id):
         SELECT
             l.*,
             COALESCE(SUM(r.amount), 0) AS repaid,
-            l.amount - COALESCE(SUM(r.amount), 0) AS remaining
+            CASE WHEN l.amount >= 0
+                 THEN l.amount - COALESCE(SUM(r.amount), 0)
+                 ELSE l.amount + COALESCE(SUM(r.amount), 0)
+            END AS remaining
         FROM loans l
         LEFT JOIN repayments r ON r.loan_id = l.id
         WHERE l.id = ?
@@ -142,11 +191,17 @@ def get_outstanding_loans():
         SELECT
             l.*,
             COALESCE(SUM(r.amount), 0) AS repaid,
-            l.amount - COALESCE(SUM(r.amount), 0) AS remaining
+            CASE WHEN l.amount >= 0
+                 THEN l.amount - COALESCE(SUM(r.amount), 0)
+                 ELSE l.amount + COALESCE(SUM(r.amount), 0)
+            END AS remaining
         FROM loans l
         LEFT JOIN repayments r ON r.loan_id = l.id
         GROUP BY l.id
-        HAVING l.amount - COALESCE(SUM(r.amount), 0) > 0
+        HAVING CASE WHEN l.amount >= 0
+                    THEN l.amount - COALESCE(SUM(r.amount), 0)
+                    ELSE l.amount + COALESCE(SUM(r.amount), 0)
+               END != 0
         ORDER BY l.lent_at DESC, l.id DESC
     """).fetchall()
     conn.close()
@@ -159,7 +214,10 @@ def get_all_loans():
         SELECT
             l.*,
             COALESCE(SUM(r.amount), 0) AS repaid,
-            l.amount - COALESCE(SUM(r.amount), 0) AS remaining
+            CASE WHEN l.amount >= 0
+                 THEN l.amount - COALESCE(SUM(r.amount), 0)
+                 ELSE l.amount + COALESCE(SUM(r.amount), 0)
+            END AS remaining
         FROM loans l
         LEFT JOIN repayments r ON r.loan_id = l.id
         GROUP BY l.id
@@ -204,7 +262,25 @@ def is_allowed(update):
 
 
 def format_amount(amount):
-    return f"₹{int(amount):,}"
+    return f"₹{abs(int(amount)):,}"
+
+
+def format_signed_amount(amount):
+    amount = int(amount)
+    return f"-₹{abs(amount):,}" if amount < 0 else f"₹{amount:,}"
+
+
+def loan_direction(loan):
+    return "owed" if int(loan["amount"]) < 0 else "lent"
+
+
+def remaining_label(loan):
+    remaining = int(loan["remaining"])
+    if remaining == 0:
+        return "settled"
+    if loan_direction(loan) == "owed":
+        return f"you owe {format_amount(remaining)}"
+    return f"they owe you {format_amount(remaining)}"
 
 
 def display_date(value):
@@ -231,6 +307,17 @@ def parse_integer_amount(text):
     return value if value > 0 else None
 
 
+def parse_signed_integer_amount(text):
+    cleaned = text.strip().replace(",", "").replace("₹", "")
+    if not re.fullmatch(r"[+-]?\d+", cleaned):
+        return None
+    try:
+        value = int(Decimal(cleaned))
+    except (ValueError, InvalidOperation):
+        return None
+    return value if value != 0 else None
+
+
 def clear_flow(context):
     for key in (
         "pending_loan",
@@ -245,12 +332,7 @@ def clear_flow(context):
 
 
 def loan_label(loan):
-    status = (
-        f"remaining {format_amount(loan['remaining'])}"
-        if loan["remaining"] > 0
-        else "returned"
-    )
-    return f"#{loan['id']} {loan['person']} — {format_amount(loan['amount'])} ({status})"
+    return f"#{loan['id']} {loan['person']} — {format_signed_amount(loan['amount'])} ({remaining_label(loan)})"
 
 
 # ---------------------------------------------------------------------------
@@ -259,21 +341,22 @@ def loan_label(loan):
 
 def build_blinko_content():
     loans = get_outstanding_loans()
-    lines = ["#Finance", "# Money Lent", ""]
+    lines = ["#Finance", "# Money Tracker", ""]
     if not loans:
-        lines.append("No outstanding loans.")
+        lines.append("No outstanding transactions.")
         return "\n".join(lines)
 
     lines.extend([
-        "| Person | Original | Repaid | Remaining | Purpose | Date |",
-        "|---|---:|---:|---:|---|---|",
+        "| Person | Type | Original | Repaid | Remaining | Purpose | Date |",
+        "|---|---|---:|---:|---:|---|---|",
     ])
     for loan in loans:
         person = loan["person"].replace("|", "\\|")
         purpose = loan["purpose"].replace("|", "\\|")
         lines.append(
-            f"| {person} | {format_amount(loan['amount'])} | "
-            f"{format_amount(loan['repaid'])} | {format_amount(loan['remaining'])} | "
+            f"| {person} | {'Owed' if loan['amount'] < 0 else 'Lent'} | "
+            f"{format_amount(loan['amount'])} | {format_amount(loan['repaid'])} | "
+            f"{format_amount(loan['remaining'])} | "
             f"{purpose} | {display_date(loan['lent_at'])} |"
         )
     return "\n".join(lines)
@@ -471,11 +554,11 @@ def parse_loan_message(text):
     amount = None
     for index, token in enumerate(tokens):
         cleaned = token.replace(",", "").replace("₹", "")
-        if not re.fullmatch(r"\d+(?:\.\d{1,2})?", cleaned):
+        if not re.fullmatch(r"[+-]?\d+(?:\.\d{1,2})?", cleaned):
             continue
         try:
             decimal_amount = Decimal(cleaned)
-            if decimal_amount <= 0 or decimal_amount != decimal_amount.quantize(Decimal("1")):
+            if decimal_amount == 0 or decimal_amount != decimal_amount.quantize(Decimal("1")):
                 continue
             amount = int(decimal_amount)
             amount_index = index
@@ -522,9 +605,9 @@ async def handle_message(update, context):
 
     context.user_data["pending_loan"] = parsed
     await update.message.reply_text(
-        f"When was this money lent?\n\n"
+        f"When was this transaction made?\n\n"
         f"Person: {parsed['person']}\n"
-        f"Amount: {format_amount(parsed['amount'])}\n"
+        f"Amount: {format_signed_amount(parsed['amount'])}\n"
         f"Purpose: {parsed['purpose']}",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("Today", callback_data="loan_date_today")],
@@ -562,9 +645,9 @@ async def show_loan_confirmation(query, context):
         await query.edit_message_text("This transaction has expired.")
         return
     await query.edit_message_text(
-        f"Record this loan?\n\n"
+        f"Record this transaction?\n\n"
         f"Person: {pending['person']}\n"
-        f"Amount: {format_amount(pending['amount'])}\n"
+        f"Amount: {format_signed_amount(pending['amount'])}\n"
         f"Purpose: {pending['purpose']}\n"
         f"Date: {display_date(pending['lent_at'])}",
         reply_markup=InlineKeyboardMarkup([[
@@ -603,8 +686,8 @@ async def confirm_loan(update, context):
     clear_flow(context)
     await sync_and_report(
         query,
-        f"✓ Recorded loan #{loan_id}\n\n"
-        f"{person} — {format_amount(amount)}\n"
+        f"✓ Recorded transaction #{loan_id}\n\n"
+        f"{person} — {format_signed_amount(amount)}\n"
         f"{purpose}\n"
         f"Date: {display_date(lent_at)}",
     )
@@ -630,7 +713,7 @@ async def returned_command(update, context):
         return
 
     buttons = [[InlineKeyboardButton(
-        f"{loan['person']} — {format_amount(loan['remaining'])} remaining",
+        f"{loan['person']} — {remaining_label(loan)}",
         callback_data=f"repay_select:{loan['id']}",
     )] for loan in loans]
     await update.message.reply_text(
@@ -644,21 +727,22 @@ async def select_repayment_loan(update, context):
     await query.answer()
     loan_id = int(query.data.split(":")[1])
     loan = get_loan(loan_id)
-    if not loan or loan["remaining"] <= 0:
-        await query.edit_message_text("This loan is already fully returned.")
+    if not loan or loan["remaining"] == 0:
+        await query.edit_message_text("This transaction is already settled.")
         return
 
     await query.edit_message_text(
         f"{loan['person']}\n\n"
-        f"Original: {format_amount(loan['amount'])}\n"
-        f"Repaid: {format_amount(loan['repaid'])}\n"
+        f"Type: {'Money you owe' if loan['amount'] < 0 else 'Money lent'}\n"
+        f"Original: {format_signed_amount(loan['amount'])}\n"
+        f"Paid/returned: {format_amount(loan['repaid'])}\n"
         f"Remaining: {format_amount(loan['remaining'])}\n"
         f"Purpose: {loan['purpose']}\n"
-        f"Lent: {display_date(loan['lent_at'])}",
+        f"Date: {display_date(loan['lent_at'])}",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("Add repayment", callback_data=f"repay_add:{loan_id}")],
             [InlineKeyboardButton(
-                f"Mark remaining {format_amount(loan['remaining'])} as returned",
+                f"Settle remaining {format_amount(loan['remaining'])}",
                 callback_data=f"repay_full:{loan_id}",
             )],
             [InlineKeyboardButton("Cancel", callback_data="repay_cancel")],
@@ -671,16 +755,16 @@ async def start_repayment(update, context):
     await query.answer()
     loan_id = int(query.data.split(":")[1])
     loan = get_loan(loan_id)
-    if not loan or loan["remaining"] <= 0:
-        await query.edit_message_text("This loan is already fully returned.")
+    if not loan or loan["remaining"] == 0:
+        await query.edit_message_text("This transaction is already settled.")
         return
 
     context.user_data["pending_repayment"] = {
         "loan_id": loan_id,
-        "max_amount": loan["remaining"],
+        "max_amount": abs(loan["remaining"]),
     }
     await query.edit_message_text(
-        f"How much was returned?\n\n"
+        f"How much was {'paid' if loan['amount'] < 0 else 'returned'}?\n\n"
         f"{loan['person']} — remaining {format_amount(loan['remaining'])}\n\n"
         "Enter the amount as a whole number."
     )
@@ -694,12 +778,12 @@ async def handle_repayment_amount_input(update, context):
         return
 
     loan = get_loan(pending["loan_id"])
-    if not loan or loan["remaining"] <= 0:
+    if not loan or loan["remaining"] == 0:
         context.user_data.pop("pending_repayment", None)
-        await update.message.reply_text("This loan is already fully returned.")
+        await update.message.reply_text("This transaction is already settled.")
         return
 
-    if amount > loan["remaining"]:
+    if amount > abs(loan["remaining"]):
         await update.message.reply_text(
             f"That amount is too high. The remaining balance is "
             f"{format_amount(loan['remaining'])}."
@@ -709,8 +793,8 @@ async def handle_repayment_amount_input(update, context):
     pending["amount"] = amount
     set_calendar_context(context, "repayment_calendar")
     await update.message.reply_text(
-        f"Repayment: {format_amount(amount)}\n"
-        f"Remaining after repayment: {format_amount(loan['remaining'] - amount)}\n\n"
+        f"Payment: {format_amount(amount)}\n"
+        f"Remaining after payment: {format_amount(abs(loan['remaining']) - amount)}\n\n"
         "When was this repayment made?",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("Today", callback_data="repay_date_today")],
@@ -752,13 +836,13 @@ async def show_repayment_confirmation(query, context):
         clear_flow(context)
         await query.edit_message_text("Loan not found.")
         return
-    remaining_after = loan["remaining"] - pending["amount"]
+    remaining_after = abs(loan["remaining"]) - pending["amount"]
     await query.edit_message_text(
         f"Record repayment?\n\n"
         f"Person: {loan['person']}\n"
-        f"Repayment: {format_amount(pending['amount'])}\n"
+        f"Payment/return: {format_amount(pending['amount'])}\n"
         f"Date: {display_date(pending['paid_at'])}\n"
-        f"Remaining after repayment: {format_amount(remaining_after)}",
+        f"Remaining after payment: {format_amount(remaining_after)}",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("Confirm", callback_data="repayment_confirm"),
             InlineKeyboardButton("Cancel", callback_data="repayment_cancel"),
@@ -789,11 +873,13 @@ async def confirm_repayment(update, context):
             await query.edit_message_text("Loan not found.")
             return
 
-        remaining = loan["amount"] - loan["repaid"]
-        if pending["amount"] > remaining:
+        remaining = (loan["amount"] - loan["repaid"]
+                    if loan["amount"] >= 0
+                    else loan["amount"] + loan["repaid"])
+        if pending["amount"] > abs(remaining):
             conn.rollback()
             await query.edit_message_text(
-                f"Repayment exceeds the remaining balance of {format_amount(remaining)}."
+                f"Payment exceeds the remaining balance of {format_amount(remaining)}."
             )
             return
 
@@ -818,7 +904,7 @@ async def confirm_repayment(update, context):
     amount = pending["amount"]
     clear_flow(context)
     status = (
-        "Loan is now fully returned."
+        "Transaction is now settled."
         if loan and loan["remaining"] == 0
         else f"Remaining: {format_amount(loan['remaining'])}"
     )
@@ -835,17 +921,17 @@ async def full_repayment(update, context):
     await query.answer()
     loan_id = int(query.data.split(":")[1])
     loan = get_loan(loan_id)
-    if not loan or loan["remaining"] <= 0:
-        await query.edit_message_text("This loan is already fully returned.")
+    if not loan or loan["remaining"] == 0:
+        await query.edit_message_text("This transaction is already settled.")
         return
 
     context.user_data["pending_repayment"] = {
         "loan_id": loan_id,
-        "amount": loan["remaining"],
+        "amount": abs(loan["remaining"]),
     }
     set_calendar_context(context, "repayment_calendar")
     await query.edit_message_text(
-        f"Mark remaining {format_amount(loan['remaining'])} as returned.\n\n"
+        f"Settle remaining {format_amount(loan['remaining'])}.\n\n"
         "When was the repayment made?",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("Today", callback_data="repay_date_today")],
@@ -870,25 +956,28 @@ async def summary_command(update, context):
     if not is_allowed(update):
         return
     loans = get_outstanding_loans()
-    total = sum(loan["remaining"] for loan in loans)
+    to_receive = sum(loan["remaining"] for loan in loans if loan["remaining"] > 0)
+    to_pay = sum(abs(loan["remaining"]) for loan in loans if loan["remaining"] < 0)
     if not loans:
-        await update.message.reply_text("Total amount to be returned: ₹0\n\nNo outstanding loans.")
+        await update.message.reply_text("Nothing outstanding.\n\nTo receive: ₹0\nTo pay: ₹0")
         return
     lines = [
-        f"Total amount to be returned: {format_amount(total)}",
+        f"To receive: {format_amount(to_receive)}",
+        f"To pay: {format_amount(to_pay)}",
+        f"Net: {format_signed_amount(to_receive - to_pay)}",
         "",
-        f"Outstanding loans: {len(loans)}",
+        f"Outstanding transactions: {len(loans)}",
         "",
     ]
     lines.extend(
-        f"{loan['person']} — {format_amount(loan['remaining'])}"
+        f"{loan['person']} — {remaining_label(loan)}"
         for loan in loans
     )
     await update.message.reply_text("\n".join(lines))
 
 
 def loan_history_text(loan, include_repayments=True):
-    status = "Outstanding" if loan["remaining"] > 0 else "Returned"
+    status = remaining_label(loan)
     lines = [
         f"#{loan['id']} — {loan['person']}",
         f"Original: {format_amount(loan['amount'])}",
@@ -961,16 +1050,20 @@ async def person_command(update, context):
         await update.message.reply_text(f"No transactions found for {person}.")
         return
 
-    total_lent = sum(loan["amount"] for loan in loans)
+    total_lent = sum(loan["amount"] for loan in loans if loan["amount"] > 0)
+    total_owed = sum(abs(loan["amount"]) for loan in loans if loan["amount"] < 0)
     total_repaid = sum(loan["repaid"] for loan in loans)
-    currently_owed = sum(loan["remaining"] for loan in loans)
-    outstanding_count = sum(loan["remaining"] > 0 for loan in loans)
+    to_receive = sum(loan["remaining"] for loan in loans if loan["remaining"] > 0)
+    to_pay = sum(abs(loan["remaining"]) for loan in loans if loan["remaining"] < 0)
+    outstanding_count = sum(loan["remaining"] != 0 for loan in loans)
 
     await update.message.reply_text(
         f"{person}\n\n"
         f"Total lent: {format_amount(total_lent)}\n"
-        f"Total repaid: {format_amount(total_repaid)}\n"
-        f"Currently owed: {format_amount(currently_owed)}\n\n"
+        f"Total borrowed: {format_amount(total_owed)}\n"
+        f"To receive: {format_amount(to_receive)}\n"
+        f"To pay: {format_amount(to_pay)}\n"
+        f"Net: {format_signed_amount(to_receive - to_pay)}\n\n"
         f"Loans: {len(loans)}\n"
         f"Outstanding loans: {outstanding_count}\n"
         f"Returned loans: {len(loans) - outstanding_count}"
@@ -1030,7 +1123,7 @@ async def view_loan(update, context):
         return
 
     buttons = []
-    if loan["remaining"] > 0:
+    if loan["remaining"] != 0:
         buttons.append([
             InlineKeyboardButton("Add repayment", callback_data=f"repay_add:{loan_id}"),
         ])
@@ -1101,7 +1194,7 @@ async def edit_field(update, context):
     current = loan[field]
     prompt = {
         "person": f"Current person: {current}\n\nEnter the new full name.",
-        "amount": f"Current amount: {format_amount(current)}\n\nEnter the new amount.",
+        "amount": f"Current amount: {format_signed_amount(current)}\n\nEnter the new amount (use a negative value for money you owe).",
         "purpose": f"Current purpose: {current}\n\nEnter the new purpose.",
     }[field]
     await query.edit_message_text(prompt)
@@ -1122,13 +1215,19 @@ async def handle_edit_input(update, context):
         return
 
     if field == "amount":
-        value = parse_integer_amount(value)
+        value = parse_signed_integer_amount(value)
         if value is None:
-            await update.message.reply_text("Enter a valid positive whole-number amount.")
+            await update.message.reply_text("Enter a non-zero whole-number amount. Use a negative value for money you owe.")
             return
-        if value < loan["repaid"]:
+        if value == 0:
+            await update.message.reply_text("Amount cannot be zero.")
+            return
+        if loan["repaid"] > 0 and ((value > 0) != (loan["amount"] > 0)):
+            await update.message.reply_text("You cannot change a lent transaction into an owed transaction (or vice versa) after repayments exist.")
+            return
+        if abs(value) < loan["repaid"]:
             await update.message.reply_text(
-                f"The new amount cannot be less than the already repaid "
+                f"The new amount cannot be smaller than the already paid/returned "
                 f"{format_amount(loan['repaid'])}."
             )
             return
@@ -1272,7 +1371,7 @@ async def handle_edit_repayment_amount(update, context):
         return
 
     loan = get_loan(repayment["loan_id"])
-    max_allowed = loan["remaining"] + repayment["amount"]
+    max_allowed = abs(loan["remaining"]) + repayment["amount"]
     if amount > max_allowed:
         await update.message.reply_text(
             f"The maximum allowed amount is {format_amount(max_allowed)}."
@@ -1506,13 +1605,16 @@ async def start_command(update, context):
         return
     await update.message.reply_text(
         "Money Tracker\n\n"
-        "Add a loan:\n"
+        "Add a transaction:\n"
         "Full Name Amount Purpose\n\n"
-        "Example:\n"
-        "Rahul Kumar 500 dinner\n\n"
+        "Positive = money you lent\n"
+        "Negative = money you owe\n\n"
+        "Examples:\n"
+        "Rahul Kumar 500 dinner\n"
+        "Rahul Kumar -500 borrowed money\n\n"
         "Commands:\n"
-        "/returned — outstanding loans and repayments\n"
-        "/summary — total amount currently owed\n"
+        "/returned — outstanding balances and repayments\n"
+        "/summary — money to receive, money to pay, and net balance\n"
         "/history — complete transaction history\n"
         "/history <person> — history for one person\n"
         "/person <name> — summary for one person\n"
@@ -1526,51 +1628,42 @@ async def start_command(update, context):
 # ---------------------------------------------------------------------------
 
 DASHBOARD_HOST = os.environ.get("DASHBOARD_HOST", "0.0.0.0")
-DASHBOARD_PORT = int(os.environ.get("DASHBOARD_PORT", "8080"))
+DASHBOARD_PORT = int(os.environ.get("DASHBOARD_PORT", "8092"))
 
 
 def get_dashboard_data():
     outstanding = get_outstanding_loans()
-
-    outstanding_amount = sum(
-        int(loan["remaining"])
-        for loan in outstanding
-    )
-
-    people_owing = len({
-        loan["person"].strip().lower()
-        for loan in outstanding
-    })
+    to_receive = sum(int(loan["remaining"]) for loan in outstanding if loan["remaining"] > 0)
+    to_pay = sum(abs(int(loan["remaining"])) for loan in outstanding if loan["remaining"] < 0)
+    net_balance = to_receive - to_pay
+    people = len({loan["person"].strip().lower() for loan in outstanding})
 
     current_month = date.today().strftime("%Y-%m")
-
     conn = get_db()
-
     lent_row = conn.execute(
-        """
-        SELECT COALESCE(SUM(amount), 0) AS total
-        FROM loans
-        WHERE substr(lent_at, 1, 7) = ?
-        """,
+        "SELECT COALESCE(SUM(amount), 0) AS total FROM loans WHERE amount > 0 AND substr(lent_at, 1, 7) = ?",
         (current_month,),
     ).fetchone()
-
+    borrowed_row = conn.execute(
+        "SELECT COALESCE(SUM(-amount), 0) AS total FROM loans WHERE amount < 0 AND substr(lent_at, 1, 7) = ?",
+        (current_month,),
+    ).fetchone()
     repaid_row = conn.execute(
-        """
-        SELECT COALESCE(SUM(amount), 0) AS total
-        FROM repayments
-        WHERE substr(paid_at, 1, 7) = ?
-        """,
+        "SELECT COALESCE(SUM(amount), 0) AS total FROM repayments WHERE substr(paid_at, 1, 7) = ?",
         (current_month,),
     ).fetchone()
-
     conn.close()
 
     return {
-        "outstanding_amount": outstanding_amount,
+        # Keep outstanding_amount for compatibility with the existing homepage widget.
+        "outstanding_amount": to_receive,
+        "to_receive": to_receive,
+        "to_pay": to_pay,
+        "net_balance": net_balance,
         "outstanding_loans": len(outstanding),
-        "people_owing": people_owing,
+        "people_owing": people,
         "lent_this_month": int(lent_row["total"]),
+        "borrowed_this_month": int(borrowed_row["total"]),
         "repaid_this_month": int(repaid_row["total"]),
     }
 

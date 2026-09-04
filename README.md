@@ -1,1511 +1,370 @@
-# Money Tracker Bot
+# Money Tracker Telegram Bot
 
-A self-hosted Telegram bot for tracking money lent to other people.
+A self-hosted Telegram bot for tracking money lent to people and money owed to other people.
 
-The bot provides a mobile-first interface for recording loans, selecting dates from a calendar, tracking partial and multiple repayments, searching transactions, editing records, and viewing outstanding balances.
+Transactions are stored locally in SQLite and synchronized to a single Blinko note containing only outstanding transactions. The SQLite database remains the source of truth.
 
-SQLite is the **source of truth** for all financial data.
+## Features
 
-Blinko contains a **single live note showing only currently outstanding loans**.
+- Add transactions directly from Telegram
+- Support full names and transaction purposes
+- Track:
+  - Money lent to someone
+  - Money owed to someone
+- Positive amount = money you should receive
+- Negative amount = money you owe
+- Choose **Today** or select a custom date from an inline calendar
+- One persistent Blinko note instead of creating multiple notes
+- Blinko note uses the `#Finance` hashtag
+- Blinko shows only outstanding transactions
+- `/returned` to view outstanding transactions and record repayments
+- Partial repayments
+- Multiple repayments for a single loan/debt
+- `/summary` for total money to receive, total money to pay, and net balance
+- `/history` for complete transaction history
+- `/history <person>` for a person's transaction history
+- `/person <name>` for a person's outstanding/history details
+- `/search <term>` to search transactions
+- `/edit` to edit transactions
+- Edit repayment amounts and dates
+- Delete transactions
+- Delete individual repayments
+- SQLite database persists through the Docker volume
+- Dashboard endpoint for a small homepage widget
+- User restriction through `ALLOWED_USER_ID`
+- Docker Compose deployment
+- Container image deployment through GHCR
 
----
-
-# Architecture
-
-```text
-                         ┌──────────────────┐
-                         │     Telegram     │
-                         │       Bot        │
-                         └────────┬─────────┘
-                                  │
-                                  ▼
-                         ┌──────────────────┐
-                         │  Money Tracker   │
-                         │      Bot         │
-                         └────────┬─────────┘
-                                  │
-                    ┌─────────────┴─────────────┐
-                    │                           │
-                    ▼                           ▼
-             ┌──────────────┐            ┌──────────────┐
-             │    SQLite    │            │    Blinko    │
-             │ Source of    │            │ Live view of │
-             │    truth     │            │ outstanding  │
-             └──────────────┘            │    loans     │
-                                         └──────────────┘
-```
-
-The application is deployed using Docker Compose.
-
-The Docker image is built by GitHub Actions and published to GitHub Container Registry (GHCR).
-
-```text
-GitHub
-   │
-   ▼
-GitHub Actions
-   │
-   ▼
-GHCR Docker Image
-   │
-   ▼
-Homelab Docker Compose
-   │
-   ▼
-Money Tracker Container
-```
-
----
-
-# Features
-
-## Loan management
-
-* Add loans through Telegram
-* Full-name support
-* Amount tracking
-* Purpose tracking
-* Custom lending date
-* Interactive calendar date picker
-* Confirmation before saving
-* Edit existing transactions
-* Permanently delete transactions
-
-## Repayment management
-
-* Mark a loan completely returned
-* Record partial repayments
-* Record multiple repayments against the same loan
-* Automatically calculate outstanding balance
-* Track the date of every repayment
-* Automatically mark a loan as fully returned when the balance reaches ₹0
-
-## Search and history
-
-* `/history`
-* `/history <person>`
-* `/person <name>`
-* `/search <query>`
-* Search by:
-
-  * Person
-  * Purpose
-  * Amount
-  * Transaction ID
-* View complete transaction history
-* View outstanding transactions
-* View repayment history
-
-## Blinko integration
-
-* Maintain exactly **one Blinko note**
-* Show only outstanding loans
-* Show remaining balance rather than original amount
-* Automatically update Blinko after:
-
-  * New loan
-  * Repayment
-  * Full return
-  * Edit
-  * Delete
-
-## Reliability
-
-* SQLite persistence
-* Docker persistent storage
-* Restic-compatible database backup
-* SQLite is independent of Blinko
-* Blinko can be rebuilt from SQLite
-* No public HTTP endpoint required for Telegram bot operation
-
----
-
-# Adding a Loan
+## Transaction format
 
 Send:
 
-```text
-Full Name Amount Purpose
-```
-
-Example:
-
-```text
-Rahul Kumar 500 dinner
-```
-
-The bot asks:
-
-```text
-When was this money lent?
-
-[ Today ]
-[ Custom date ]
-[ Cancel ]
-```
-
----
-
-# Date Selection
-
-## Today
-
-Selecting `Today` uses the current date.
-
-## Custom date
-
-Selecting `Custom date` opens an interactive calendar.
-
-Example:
-
-```text
-       September 2026
-
-[Mo] [Tu] [We] [Th] [Fr] [Sa] [Su]
-     [1]  [2]  [3]  [4]  [5]  [6]
- [7] [8]  [9] [10] [11] [12] [13]
-[14] [15] [16] [17] [18] [19] [20]
-[21] [22] [23] [24] [25] [26] [27]
-[28] [29] [30]
-
-[◀] [September 2026] [▶]
-
-[Today] [Cancel]
-```
-
-The selected date is then used for the transaction.
-
----
-
-# Loan Confirmation
-
-After selecting the date:
-
-```text
-Record this loan?
-
-Person: Rahul Kumar
-Amount: ₹500
-Purpose: dinner
-Date: 02-09-2026
-
-[ Confirm ] [ Cancel ]
-```
-
-Selecting `Confirm` stores the transaction in SQLite and synchronizes Blinko.
-
----
-
-# Database Model
-
-Because a loan can have multiple repayments, loans and repayments are stored separately.
-
-```text
-loans
-├── id
-├── person
-├── amount
-├── purpose
-├── lent_at
-├── created_at
-└── updated_at
-
-repayments
-├── id
-├── loan_id
-├── amount
-├── paid_at
-└── created_at
-```
-
-Relationship:
-
-```text
-Loan #12
-₹5,000
-│
-├── Repayment #1
-│   ₹1,000
-│
-├── Repayment #2
-│   ₹1,500
-│
-└── Repayment #3
-    ₹500
-```
-
-Total repaid:
-
-```text
-₹3,000
-```
-
-Outstanding:
-
-```text
-₹5,000 - ₹3,000 = ₹2,000
-```
-
-The outstanding balance is calculated from the repayment records rather than stored as an independent value.
-
-This prevents the balance from becoming inconsistent.
-
----
-
-# Partial Repayments
-
-A borrower does not have to return the entire amount at once.
-
-For example:
-
-```text
-Original loan: ₹5,000
-```
-
-The person returns:
-
-```text
-₹1,000
-```
-
-The bot records:
-
-```text
-Repayment: ₹1,000
-Remaining: ₹4,000
-```
-
-The loan remains outstanding.
-
-Blinko displays:
-
-```text
-| Person | Original | Repaid | Remaining | Purpose | Date |
-|---|---:|---:|---:|---|---|
-| Rahul Kumar | ₹5,000 | ₹1,000 | ₹4,000 | dinner | 02-09-2026 |
-```
-
----
-
-# Multiple Repayments
-
-The same loan can have any number of repayments.
-
-Example:
-
-```text
-Original loan: ₹10,000
-
-Repayment 1: ₹2,000
-Repayment 2: ₹3,000
-Repayment 3: ₹1,000
-```
-
-The database contains three separate repayment records.
-
-```text
-Total repaid: ₹6,000
-Remaining: ₹4,000
-```
-
-The original loan remains one transaction.
-
-This is important because it preserves the complete repayment history.
-
----
-
-# Full Repayment
-
-When the total repayments equal the original loan amount:
-
-```text
-Original: ₹5,000
-Repaid:   ₹5,000
-Remaining: ₹0
-```
-
-The loan is automatically considered fully returned.
-
-It disappears from the Blinko outstanding-loans note.
-
-The loan and all repayment records remain in SQLite.
-
----
-
-# `/returned`
-
-Displays outstanding loans.
-
-Example:
-
-```text
-Outstanding loans:
-
-[Rahul Kumar — ₹4,000]
-[Anu Thomas — ₹1,200]
-[John — ₹300]
-```
-
-Selecting a loan displays repayment options.
-
-```text
-Rahul Kumar
-
-Original: ₹5,000
-Repaid: ₹1,000
-Remaining: ₹4,000
-
-[Add repayment]
-[Mark remaining ₹4,000 as returned]
-[Cancel]
-```
-
-## Add repayment
-
-Selecting `Add repayment` asks for the repayment amount.
-
-Example:
-
-```text
-How much was returned?
-
-Enter amount:
-```
-
-The user enters:
-
-```text
-1500
-```
-
-The bot then asks for the repayment date:
-
-```text
-When was this repayment made?
-
-[ Today ]
-[ Custom date ]
-[ Cancel ]
-```
-
-After selecting the date:
-
-```text
-Record repayment?
-
-Person: Rahul Kumar
-Repayment: ₹1,500
-Date: 04-09-2026
-Remaining after repayment: ₹2,500
-
-[ Confirm ] [ Cancel ]
-```
-
-The repayment is then added to the `repayments` table.
-
----
-
-# Preventing Invalid Repayments
-
-A repayment cannot exceed the current outstanding balance.
-
-For example:
-
-```text
-Original: ₹5,000
-Already repaid: ₹3,000
-Remaining: ₹2,000
-```
-
-Trying to enter:
-
-```text
-₹2,500
-```
-
-will be rejected.
-
-The bot will explain:
-
-```text
-The repayment cannot exceed the remaining balance of ₹2,000.
-```
-
-This prevents negative balances.
-
----
-
-# `/summary`
-
-Displays the total amount currently owed to you.
-
-Example:
-
-```text
-Total amount to be returned: ₹7,500
-
-Outstanding loans: 3
-
-Rahul Kumar — ₹2,500
-Anu Thomas — ₹4,000
-John — ₹1,000
-```
-
-The total is calculated from current outstanding balances.
-
-Returned loans are excluded.
-
----
-
-# `/history`
-
-Displays complete transaction history.
-
-Example:
-
-```text
-Transaction history:
-
-#12 — Rahul Kumar
-Original: ₹5,000
-Repaid: ₹2,500
-Remaining: ₹2,500
-Purpose: dinner
-Lent: 02-09-2026
-Status: Outstanding
-
-#11 — Anu Thomas
-Original: ₹1,200
-Repaid: ₹1,200
-Remaining: ₹0
-Purpose: shopping
-Lent: 01-09-2026
-Status: Returned
-```
-
-Returned transactions remain available.
-
----
-
-# `/history <person>`
-
-Shows the transaction history for a specific person.
-
-Example:
-
-```text
-/history Rahul Kumar
-```
-
-The bot returns all loans associated with Rahul Kumar.
-
-Example:
-
-```text
-Rahul Kumar
-
-#12
-Original: ₹5,000
-Repaid: ₹2,500
-Remaining: ₹2,500
-Purpose: dinner
-Lent: 02-09-2026
-Status: Outstanding
-
-#8
-Original: ₹2,000
-Repaid: ₹2,000
-Remaining: ₹0
-Purpose: fuel
-Lent: 20-08-2026
-Status: Returned
-```
-
-The command should support names containing spaces.
-
----
-
-# `/person <name>`
-
-Provides a summary for one person.
-
-Example:
-
-```text
-/person Rahul Kumar
-```
-
-Result:
-
-```text
-Rahul Kumar
-
-Total lent: ₹7,000
-Total repaid: ₹4,500
-Currently owed: ₹2,500
-
-Loans: 2
-Outstanding loans: 1
-Returned loans: 1
-```
-
-This is different from `/history`.
-
-`/history Rahul Kumar` shows the transactions.
-
-`/person Rahul Kumar` shows the person's overall financial summary.
-
----
-
-# Search
-
-The bot provides:
-
-```text
-/search <query>
-```
+    Full Name Amount Purpose
 
 Examples:
 
-```text
-/search Rahul
-```
+    Rahul Kumar 500 dinner
 
-```text
-/search dinner
-```
+    John Thomas 1200 shopping
 
-```text
-/search 500
-```
+    Anu -250 borrowed cash
 
-Search should operate across:
+### Amount rules
 
-* Person name
-* Purpose
-* Loan ID
-* Original amount
-* Repayment information where appropriate
+Positive:
 
-Example:
+    Rahul Kumar 500 dinner
 
-```text
-/search dinner
-```
+Means:
 
-Result:
+> Rahul Kumar owes you ₹500.
 
-```text
-Search results for "dinner":
+Negative:
 
-#12 — Rahul Kumar
-₹5,000
-dinner
-Remaining: ₹2,500
-02-09-2026
+    Rahul Kumar -500 borrowed cash
 
-#7 — John
-₹1,500
-dinner
-Returned
-20-08-2026
-```
+Means:
 
-Search results should use Telegram inline buttons so a transaction can be selected for further actions.
+> You owe Rahul Kumar ₹500.
 
----
+Amounts can include commas:
 
-# Editing Transactions
+    Rahul Kumar 1,500 shopping
 
-The bot provides:
+## Dates
 
-```text
-/edit
-```
+When adding a transaction, the bot asks when the transaction occurred.
 
-The bot displays transactions that can be edited.
+Choose:
 
-Example:
+- **Today**
+- **Custom date**
 
-```text
-Select transaction:
+The custom-date option opens an inline calendar. You can move between months and select the exact date.
 
-[#12 Rahul Kumar — ₹5,000]
-[#11 Anu Thomas — ₹1,200]
-[#10 John — ₹300]
-```
+The same date-selection system is used for repayments and supported date edits.
 
-Selecting a transaction shows:
+## Repayments
 
-```text
-Edit transaction #12
-
-[Person]
-[Amount]
-[Purpose]
-[Date]
-[Cancel]
-```
-
-The user can modify individual fields.
-
-Example:
-
-```text
-Person:
-Rahul Kumar
-```
-
-can be changed to:
-
-```text
-Rahul Kumar Nair
-```
-
-The same applies to:
-
-* Person
-* Original amount
-* Purpose
-* Lending date
-
-After modification:
-
-```text
-Save changes?
-
-Person: Rahul Kumar Nair
-Amount: ₹5,000
-Purpose: dinner
-Date: 02-09-2026
-
-[ Save ] [ Cancel ]
-```
-
-Blinko is synchronized after the change.
-
----
-
-# Editing Amounts With Repayments
-
-Editing an original loan amount requires validation.
-
-Example:
-
-```text
-Original loan: ₹5,000
-Repayments: ₹3,000
-```
-
-The user cannot change the original loan to:
-
-```text
-₹2,000
-```
-
-because repayments already exceed the new loan amount.
-
-The bot must reject the change.
-
-The new original amount must always be greater than or equal to the total repayments already recorded.
-
-Example:
-
-```text
-Original: ₹5,000
-Repaid: ₹3,000
-
-Valid:
-₹3,000
-₹4,000
-₹5,000
-₹6,000
-
-Invalid:
-₹2,999
-₹2,000
-```
-
-This prevents inconsistent financial records.
-
----
-
-# Editing Repayments
-
-Repayments should also be individually identifiable.
+A transaction can have multiple repayments.
 
 For example:
 
-```text
-Loan #12
+- Lent ₹1,000
+- Repaid ₹300
+- Repaid ₹200
+- Remaining ₹500
 
-Repayments:
+The database keeps each repayment separately, preserving the complete history.
 
-[#21 — ₹1,000 — 03-09-2026]
-[#24 — ₹1,500 — 04-09-2026]
-```
+For money you owe, repayments represent payments you make toward the debt.
 
-Selecting a repayment allows:
+A transaction becomes fully settled when its remaining balance reaches zero.
 
-```text
-[Edit amount]
-[Edit date]
-[Delete repayment]
-[Cancel]
-```
+## Commands
 
-Changing a repayment amount must never allow the total repayments to exceed the original loan amount.
+### `/start`
 
----
+Shows the bot usage and available commands.
 
-# `/delete`
+### `/returned`
 
-Displays transactions for permanent deletion.
+Shows outstanding transactions.
 
-Example:
+Select a transaction to:
 
-```text
-Select transaction:
+- Add a partial repayment
+- Record a full repayment
+- Continue tracking the remaining balance
 
-[#12 Rahul Kumar — ₹5,000 — ₹2,500 remaining]
-[#11 Anu Thomas — ₹1,200 — Returned]
-```
+### `/summary`
 
-Selecting a transaction shows a confirmation.
+Shows:
 
-```text
-Permanently delete this transaction?
+- Total amount to receive
+- Total amount to pay
+- Net balance
+- Outstanding transaction count
 
-#12
-Rahul Kumar
-Original: ₹5,000
-Repaid: ₹2,500
-Remaining: ₹2,500
+### `/history`
 
-This will also delete all repayment records.
+Shows complete transaction history, including repayments.
 
-[Delete permanently]
-[Cancel]
-```
+You can also use:
 
-Deleting a loan also deletes its associated repayments.
+    /history Rahul Kumar
 
-The deletion should use a database transaction so the loan and its repayments cannot be left in an inconsistent state.
+to view history for a specific person.
 
----
+### `/person <name>`
 
-# Blinko Integration
-
-Blinko contains exactly **one note** for outstanding loans.
+Shows information for a specific person.
 
 Example:
 
-```text
-# Money Lent
+    /person Rahul Kumar
 
-| Person | Original | Repaid | Remaining | Purpose | Date |
-|---|---:|---:|---:|---|---|
-| Rahul Kumar | ₹5,000 | ₹2,500 | ₹2,500 | dinner | 02-09-2026 |
-| Anu Thomas | ₹1,200 | ₹0 | ₹1,200 | shopping | 01-09-2026 |
-```
+### `/search <term>`
 
-Only loans with a remaining balance greater than ₹0 appear.
-
----
-
-# Blinko Is Not the Source of Truth
-
-SQLite is authoritative.
-
-Blinko is a generated view.
-
-```text
-                    SQLite
-                      │
-          ┌───────────┴───────────┐
-          │                       │
-          ▼                       ▼
-     All transactions       Outstanding
-          │                  balances
-          │                       │
-          │                       ▼
-          │                    Blinko
-          │                 Single note
-          │
-          ├── Outstanding
-          └── Returned
-```
-
-This means:
-
-* Blinko can be deleted without losing financial data.
-* Returned transactions remain in SQLite.
-* Repayment history remains in SQLite.
-* Blinko can be regenerated from SQLite.
-
----
-
-# Blinko Synchronization
-
-Blinko should be synchronized after every operation that affects the outstanding balance or displayed transaction information.
-
-These operations include:
-
-```text
-Add loan
-   ↓
-Blinko sync
-
-Edit loan
-   ↓
-Blinko sync
-
-Add repayment
-   ↓
-Blinko sync
-
-Edit repayment
-   ↓
-Blinko sync
-
-Delete repayment
-   ↓
-Blinko sync
-
-Fully repay loan
-   ↓
-Blinko sync
-
-Delete loan
-   ↓
-Blinko sync
-```
-
-If Blinko is temporarily unavailable, the database operation should still succeed.
-
-The bot should report the synchronization failure rather than losing the transaction.
-
-A subsequent synchronization can rebuild the Blinko note from SQLite.
-
----
-
-# Data Integrity
-
-All financial calculations should be derived from the database.
-
-For every loan:
-
-```text
-total_repaid = SUM(repayments.amount)
-
-outstanding =
-    loan.amount - total_repaid
-```
-
-A loan is considered returned when:
-
-```text
-outstanding == 0
-```
-
-A loan is outstanding when:
-
-```text
-outstanding > 0
-```
-
-Negative outstanding balances must never be permitted.
-
----
-
-# Database Transactions
-
-Operations affecting multiple records must use SQLite transactions.
-
-For example, deleting a loan:
-
-```text
-BEGIN TRANSACTION
-
-Delete repayments
-Delete loan
-
-COMMIT
-```
-
-If anything fails:
-
-```text
-ROLLBACK
-```
-
-This prevents orphaned repayment records.
-
----
-
-# Database Schema
-
-Recommended schema:
-
-```sql
-CREATE TABLE loans (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    person TEXT NOT NULL,
-    amount INTEGER NOT NULL CHECK(amount > 0),
-    purpose TEXT NOT NULL,
-    lent_at TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-```
-
-```sql
-CREATE TABLE repayments (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    loan_id INTEGER NOT NULL,
-    amount INTEGER NOT NULL CHECK(amount > 0),
-    paid_at TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-
-    FOREIGN KEY (loan_id)
-        REFERENCES loans(id)
-        ON DELETE CASCADE
-);
-```
-
-Useful indexes:
-
-```sql
-CREATE INDEX idx_loans_person
-ON loans(person);
-```
-
-```sql
-CREATE INDEX idx_loans_lent_at
-ON loans(lent_at);
-```
-
-```sql
-CREATE INDEX idx_repayments_loan_id
-ON repayments(loan_id);
-```
-
----
-
-# Currency
-
-Amounts are stored as integer currency units.
-
-For Indian Rupees:
-
-```text
-₹500
-```
-
-is stored as:
-
-```text
-500
-```
-
-This avoids floating-point rounding problems.
-
-Decimal currency values should not be used unless there is a specific requirement for paise.
-
----
-
-# Telegram Commands
-
-| Command             | Purpose                                 |
-| ------------------- | --------------------------------------- |
-| `/start`            | Show help                               |
-| `/summary`          | Total currently owed                    |
-| `/returned`         | Manage outstanding loans and repayments |
-| `/history`          | Complete transaction history            |
-| `/history <person>` | History for a person                    |
-| `/person <name>`    | Person-level financial summary          |
-| `/search <query>`   | Search transactions                     |
-| `/edit`             | Edit a transaction                      |
-| `/delete`           | Permanently delete a transaction        |
-
----
-
-# Example Complete Workflow
-
-## 1. Create loan
-
-```text
-Rahul Kumar 5000 laptop
-```
-
-Select:
-
-```text
-[Today]
-```
-
-Confirm.
-
-Database:
-
-```text
-Loan #1
-Original: ₹5,000
-Repaid: ₹0
-Remaining: ₹5,000
-```
-
-Blinko:
-
-```text
-Rahul Kumar | ₹5,000 | ₹0 | ₹5,000
-```
-
----
-
-## 2. First repayment
-
-Use:
-
-```text
-/returned
-```
-
-Select Rahul.
-
-Select:
-
-```text
-[Add repayment]
-```
-
-Enter:
-
-```text
-1000
-```
-
-Select the date and confirm.
-
-Database:
-
-```text
-Original: ₹5,000
-Repaid: ₹1,000
-Remaining: ₹4,000
-```
-
-Blinko automatically changes to:
-
-```text
-Rahul Kumar | ₹5,000 | ₹1,000 | ₹4,000
-```
-
----
-
-## 3. Second repayment
-
-Add:
-
-```text
-2000
-```
-
-Now:
-
-```text
-Original: ₹5,000
-Repaid: ₹3,000
-Remaining: ₹2,000
-```
-
-The loan remains outstanding.
-
----
-
-## 4. Final repayment
-
-Add:
-
-```text
-2000
-```
-
-Now:
-
-```text
-Original: ₹5,000
-Repaid: ₹5,000
-Remaining: ₹0
-```
-
-The loan is automatically considered returned.
-
-It disappears from Blinko.
-
-It remains in:
-
-```text
-/history
-```
-
----
-
-# Storage
-
-The SQLite database is stored outside the Docker container.
+Searches transaction and repayment information.
 
 Example:
 
-```text
-./data/money.db
-```
+    /search shopping
 
-On the homelab server:
+### `/edit`
 
-```text
-/opt/homelab/stacks/money-tracker/data/money.db
-```
+Select a transaction and edit supported fields.
 
-The database must be included in the existing Restic backup configuration.
+Repayment records can also be edited individually.
 
-The database must **never** be committed to Git.
+### `/delete`
 
----
+Permanently deletes a transaction after confirmation.
 
-# Backup
+Individual repayments can also be deleted.
 
-The most important application data is:
+## Blinko integration
 
-```text
-data/money.db
-```
+The bot maintains **one Blinko note** rather than creating a new note for every transaction.
 
-SQLite contains:
-
-* Loans
-* Repayments
-* Dates
-* Return history
-* Transaction history
-* Blinko note configuration
-
-Restic should back up this directory.
-
-```text
-SQLite
-   │
-   ▼
-Restic
-   │
-   ▼
-Backup Storage
-```
-
----
-
-# Recovery
-
-If the Docker container is lost:
-
-1. Restore `money.db`.
-2. Restore `.env`.
-3. Pull the Docker image.
-4. Start the container.
-5. Verify the database.
-6. Synchronize Blinko.
-
-Because Blinko is only a derived view, losing the Blinko note does not mean losing the financial history.
-
----
-
-# Environment Variables
-
-Create `.env` on the server.
-
-```dotenv
-TELEGRAM_BOT_TOKEN=your_telegram_bot_token
-
-BLINKO_URL=http://blinko-website:1111
-
-BLINKO_API_TOKEN=your_blinko_api_token
-
-ALLOWED_USER_ID=your_telegram_user_id
-
-TZ=Asia/Kolkata
-```
-
-Never commit `.env`.
-
-The repository should contain:
-
-```text
-.env.example
-```
-
-instead.
-
----
-
-# Docker Deployment
-
-The production server uses the published GHCR image.
+The note contains only outstanding transactions.
 
 Example:
 
-```yaml
-services:
-  money-tracker:
-    image: ghcr.io/YOUR_USERNAME/money-tracker:main
+    # Money Lent & Owed
 
-    container_name: money-tracker
+    | Person | Type | Remaining | Purpose | Date |
+    |---|---|---:|---|---|
+    | Rahul Kumar | Lent | ₹500 | Dinner | 04-09-2026 |
+    | John Thomas | Owed | ₹300 | Borrowed cash | 02-09-2026 |
 
-    restart: unless-stopped
+    #Finance
 
-    env_file:
-      - .env
+When a transaction is fully settled or deleted, it disappears from the Blinko note.
 
-    environment:
-      DB_PATH: /data/money.db
+The SQLite database retains the historical information.
 
-    volumes:
-      - ./data:/data
+## Data storage
+
+The SQLite database is stored at:
+
+    /data/money.db
+
+Docker Compose maps this to:
+
+    ./data:/data
+
+Therefore the database survives container recreation and image updates.
+
+**Back up `data/money.db` regularly.**
+
+The database is the source of truth. If Blinko is temporarily unavailable, transactions can still be recorded in SQLite and synchronized later.
+
+## Dashboard
+
+The application includes a small dashboard API intended for a homepage/service dashboard widget.
+
+The dashboard exposes current information such as:
+
+- Total to receive
+- Total to pay
+- Net balance
+- Outstanding transaction count
+
+The dashboard service uses port:
+
+    8092
+
+When running behind your existing Docker/Traefik setup, expose it according to your homelab routing configuration.
+
+## Environment variables
+
+Create a `.env` file:
+
+    TELEGRAM_BOT_TOKEN=your_telegram_bot_token
+    BLINKO_URL=https://blinko.example.com
+    BLINKO_API_TOKEN=your_blinko_api_token
+    ALLOWED_USER_ID=your_telegram_user_id
+
+Optional:
+
+    DB_PATH=/data/money.db
+
+Do not commit `.env` to Git.
+
+## Docker Compose
+
+The production server uses Docker Compose and pulls the pre-built container image from GitHub Container Registry.
+
+Example:
+
+    services:
+      money-tracker:
+        image: ghcr.io/albynbabu97/lent-tracker:VERSION
+        container_name: money-tracker
+        restart: unless-stopped
+
+        env_file:
+          - .env
+
+        environment:
+          DB_PATH: /data/money.db
+
+        volumes:
+          - ./data:/data
+
+        networks:
+          - homelab
+
+        logging:
+          options:
+            max-size: 10m
+            max-file: "3"
 
     networks:
-      - homelab
-
-    logging:
-      options:
-        max-size: 10m
-        max-file: "3"
-
-networks:
-  homelab:
-    external: true
-```
+      homelab:
+        external: true
 
-Blinko is accessed through the internal Docker network:
+Replace `VERSION` with the desired image tag.
 
-```text
-http://blinko-website:1111
-```
+## Versioned image deployment
 
-Traefik and Cloudflare are not required for bot-to-Blinko communication.
+Prefer immutable version tags instead of `latest`.
 
----
+Example:
 
-# CI/CD
+    image: ghcr.io/albynbabu97/lent-tracker:v1.3.0
 
-Application code is stored in Git.
+After changing the code:
 
-GitHub Actions builds the Docker image.
+1. Commit the changes.
+2. Push the commit to GitHub.
+3. GitHub Actions builds and publishes the image.
+4. Update the server's Compose file to the new version.
+5. Pull the new image.
+6. Recreate the container.
 
-```text
-git push
-    │
-    ▼
-GitHub Actions
-    │
-    ├── Checkout
-    ├── Build Docker image
-    ├── Authenticate with GHCR
-    └── Push image
-            │
-            ▼
-           GHCR
-```
+Example:
 
-The production server pulls the new image:
+    docker compose pull
+    docker compose up -d
 
-```bash
-docker compose pull
-docker compose up -d
-```
+Check the deployment:
 
-Check status:
+    docker compose ps
 
-```bash
-docker compose ps
-```
+View logs:
 
-Check logs:
+    docker compose logs -f money-tracker
 
-```bash
-docker compose logs -f
-```
+## GitHub Actions
 
----
+The repository builds the Docker image and publishes it to GHCR.
 
-# Repository Structure
+The server does not need the Python source code or Python packages installed locally. It only needs Docker Compose and the persistent data directory.
 
-```text
-money-tracker/
-│
-├── .github/
-│   └── workflows/
-│       └── docker.yml
-│
-├── bot/
-│   ├── Dockerfile
-│   ├── requirements.txt
-│   └── bot.py
-│
-├── data/
-│   └── money.db
-│
-├── compose.yaml
-├── .env.example
-├── .gitignore
-└── README.md
-```
+This keeps the production server cleaner and makes deployments reproducible.
 
-`data/money.db` is runtime data and must be excluded from Git.
+## Backup
 
----
+The most important file is:
 
-# Security
+    ./data/money.db
 
-* Telegram access is restricted using `ALLOWED_USER_ID`.
-* Telegram credentials are stored in `.env`.
-* Blinko API credentials are stored in `.env`.
-* Secrets must never be committed to Git.
-* SQLite is stored outside the container.
-* The bot does not require a public HTTP endpoint.
-* Blinko communication uses the internal Docker network.
-* Traefik and Cloudflare are not required for internal bot communication.
+Recommended backup approach:
 
----
+- Include `money.db` in your existing homelab backup system.
+- Keep multiple historical backup versions.
+- Test restoration periodically.
 
-# Design Principles
+Do not rely on Blinko as the only backup. Blinko is a synchronized view of outstanding transactions; SQLite contains the complete transaction and repayment history.
 
-## SQLite is the source of truth
+## Security
 
-All financial history lives in SQLite.
+- Keep the Telegram bot token secret.
+- Keep the Blinko API token secret.
+- Keep `.env` out of Git.
+- Set `ALLOWED_USER_ID` so only your Telegram account can use the bot.
+- Do not expose the SQLite database directly.
+- Use your existing Traefik/Cloudflare setup for dashboard access if the dashboard is exposed externally.
 
-## Blinko is a view
+## Development
 
-Blinko only shows what is currently outstanding.
+Install dependencies:
 
-## One Blinko note
+    pip install -r requirements.txt
 
-The application should never create a new Blinko note for every loan.
+Run locally:
 
-There should be exactly one managed note.
+    python bot.py
 
-## Repayments are separate records
+Build the Docker image:
 
-A loan and its repayments are different entities.
+    docker build -t lent-tracker .
 
-This makes it possible to accurately track:
+Run with Docker Compose:
 
-```text
-₹10,000 loan
+    docker compose up -d
 
-₹2,000 repayment
-₹3,000 repayment
-₹1,000 repayment
+## Repository structure
 
-Total repaid: ₹6,000
-Remaining: ₹4,000
-```
+    .
+    ├── bot.py
+    ├── Dockerfile
+    ├── requirements.txt
+    ├── compose.yaml
+    ├── .env
+    └── data/
+        └── money.db
 
-## Calculations are derived
+`.env` and `data/` should not be committed to Git.
 
-The outstanding amount should always be calculated from:
+## Requirements
 
-```text
-Original amount - Total repayments
-```
-
-rather than manually maintaining a balance field.
-
-## Every destructive action requires confirmation
-
-This applies to:
-
-* Deleting loans
-* Deleting repayments
-* Editing amounts
-* Marking remaining balances as returned
-
----
-
-# Future Improvements
-
-Potential future features:
-
-* Automatic Telegram reminders for outstanding loans
-* Scheduled `/summary`
-* Monthly financial reports
-* CSV export
-* Excel export
-* Per-person repayment reminders
-* Backup verification
-* Automatic Blinko recovery/synchronization
-* Automatic deployment after a successful GHCR build
-* Transaction pagination for very large histories
-* Audit log for edits and deletions
-
-## Dashboard API
-
-The Money Tracker exposes a small read-only API for integrating with dashboards such as [Homepage](https://gethomepage.dev/).
-
-### Endpoint
-
-```text
-GET /api/dashboard
-```
-
-The API listens on port `8092` inside the Docker network.
-
-Example response:
-
-```json
-{
-  "outstanding_amount": 12450,
-  "outstanding_loans": 7,
-  "people_owing": 5,
-  "lent_this_month": 8200,
-  "repaid_this_month": 3500
-}
-```
-
-### Fields
-
-| Field                | Description                                       |
-| -------------------- | ------------------------------------------------- |
-| `outstanding_amount` | Total amount still owed across all loans          |
-| `outstanding_loans`  | Number of loans with an outstanding balance       |
-| `people_owing`       | Number of unique people with outstanding balances |
-| `lent_this_month`    | Total amount lent during the current month        |
-| `repaid_this_month`  | Total amount repaid during the current month      |
-
-The outstanding amount is calculated from the loan and repayment records, so partial repayments and multiple repayments for the same loan are supported correctly.
-
-### Docker
-
-The dashboard API uses the existing `homelab` Docker network and does not require a published host port.
-
-The container is configured with:
-
-```yaml
-environment:
-  DB_PATH: /data/money.db
-  DASHBOARD_PORT: 8092
-```
-
-This keeps the API internal to the Docker network. Homepage can access it using:
-
-```text
-http://money-tracker:8092/api/dashboard
-```
-
-### Testing
-
-After deployment, verify the API from inside the container:
-
-```bash
-docker exec money-tracker wget -qO- http://127.0.0.1:8092/api/dashboard
-```
-
-A successful response should contain the dashboard statistics as JSON.
+- Docker
+- Docker Compose
+- Telegram bot
+- Blinko instance with API access
+- SQLite
+- GitHub Actions/GHCR for the production image workflow
