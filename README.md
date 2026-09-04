@@ -1445,3 +1445,67 @@ Potential future features:
 * Automatic deployment after a successful GHCR build
 * Transaction pagination for very large histories
 * Audit log for edits and deletions
+
+## Dashboard API
+
+The Money Tracker exposes a small read-only API for integrating with dashboards such as [Homepage](https://gethomepage.dev/).
+
+### Endpoint
+
+```text
+GET /api/dashboard
+```
+
+The API listens on port `8092` inside the Docker network.
+
+Example response:
+
+```json
+{
+  "outstanding_amount": 12450,
+  "outstanding_loans": 7,
+  "people_owing": 5,
+  "lent_this_month": 8200,
+  "repaid_this_month": 3500
+}
+```
+
+### Fields
+
+| Field                | Description                                       |
+| -------------------- | ------------------------------------------------- |
+| `outstanding_amount` | Total amount still owed across all loans          |
+| `outstanding_loans`  | Number of loans with an outstanding balance       |
+| `people_owing`       | Number of unique people with outstanding balances |
+| `lent_this_month`    | Total amount lent during the current month        |
+| `repaid_this_month`  | Total amount repaid during the current month      |
+
+The outstanding amount is calculated from the loan and repayment records, so partial repayments and multiple repayments for the same loan are supported correctly.
+
+### Docker
+
+The dashboard API uses the existing `homelab` Docker network and does not require a published host port.
+
+The container is configured with:
+
+```yaml
+environment:
+  DB_PATH: /data/money.db
+  DASHBOARD_PORT: 8092
+```
+
+This keeps the API internal to the Docker network. Homepage can access it using:
+
+```text
+http://money-tracker:8092/api/dashboard
+```
+
+### Testing
+
+After deployment, verify the API from inside the container:
+
+```bash
+docker exec money-tracker wget -qO- http://127.0.0.1:8092/api/dashboard
+```
+
+A successful response should contain the dashboard statistics as JSON.

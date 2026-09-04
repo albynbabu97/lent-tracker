@@ -5,6 +5,9 @@ import re
 import sqlite3
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
+import json
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import requests
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -1518,6 +1521,111 @@ async def start_command(update, context):
         "/delete — permanently delete a loan"
     )
 
+# ---------------------------------------------------------------------------
+# Homepage dashboard API
+# ---------------------------------------------------------------------------
+
+DASHBOARD_HOST = os.environ.get("DASHBOARD_HOST", "0.0.0.0")
+DASHBOARD_PORT = int(os.environ.get("DASHBOARD_PORT", "8080"))
+
+
+def get_dashboard_data():
+    outstanding = get_outstanding_loans()
+
+    outstanding_amount = sum(
+        int(loan["remaining"])
+        for loan in outstanding
+    )
+
+    people_owing = len({
+        loan["person"].strip().lower()
+        for loan in outstanding
+    })
+
+    current_month = date.today().strftime("%Y-%m")
+
+    conn = get_db()
+
+    lent_row = conn.execute(
+        """
+        SELECT COALESCE(SUM(amount), 0) AS total
+        FROM loans
+        WHERE substr(lent_at, 1, 7) = ?
+        """,
+        (current_month,),
+    ).fetchone()
+
+    repaid_row = conn.execute(
+        """
+        SELECT COALESCE(SUM(amount), 0) AS total
+        FROM repayments
+        WHERE substr(paid_at, 1, 7) = ?
+        """,
+        (current_month,),
+    ).fetchone()
+
+    conn.close()
+
+    return {
+        "outstanding_amount": outstanding_amount,
+        "outstanding_loans": len(outstanding),
+        "people_owing": people_owing,
+        "lent_this_month": int(lent_row["total"]),
+        "repaid_this_month": int(repaid_row["total"]),
+    }
+
+
+class DashboardHandler(BaseHTTPRequestHandler):
+
+    def do_GET(self):
+        if self.path != "/api/dashboard":
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        try:
+            data = get_dashboard_data()
+            body = json.dumps(data).encode("utf-8")
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        except Exception:
+            logger.exception("Dashboard API failed")
+
+            body = b'{"error":"internal server error"}'
+
+            self.send_response(500)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        return
+
+
+def start_dashboard_server():
+    server = ThreadingHTTPServer(
+        (DASHBOARD_HOST, DASHBOARD_PORT),
+        DashboardHandler,
+    )
+
+    logger.info(
+        "Dashboard API listening on %s:%s",
+        DASHBOARD_HOST,
+        DASHBOARD_PORT,
+    )
+
+    thread = threading.Thread(
+        target=server.serve_forever,
+        daemon=True,
+    )
+    thread.start()
 
 # ---------------------------------------------------------------------------
 # Main
@@ -1525,6 +1633,7 @@ async def start_command(update, context):
 
 def main():
     init_db()
+    start_dashboard_server()
 
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
